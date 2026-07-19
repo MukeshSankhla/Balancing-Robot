@@ -54,6 +54,26 @@ def frame_brake(motor_id):
     """Build electric brake command frame."""
     return build_frame(motor_id, 0x64, [0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00])
 
+# --- Latest Line Reader for Serial ---
+class LatestLineReader:
+    def __init__(self, ser):
+        self.ser = ser
+        self.buffer = b""
+
+    def get_latest_line(self):
+        try:
+            in_waiting = self.ser.in_waiting
+            if in_waiting > 0:
+                self.buffer += self.ser.read(in_waiting)
+        except Exception:
+            return None
+        
+        lines = self.buffer.split(b"\n")
+        if len(lines) > 1:
+            self.buffer = lines[-1]
+            return lines[-2].decode('utf-8', errors='ignore').strip()
+        return None
+
 # --- PID Controller ---
 class PIDController:
     def __init__(self, kp, ki, kd, target=0.0):
@@ -212,7 +232,7 @@ def main():
     # Clear IMU input buffer to avoid lag/stale readings
     ser_esp.reset_input_buffer()
     
-    last_time = time.time()
+    last_imu_time = time.time()
     last_dashboard_time = 0
     loop_count = 0
     last_commanded_speed = 0.0
@@ -222,29 +242,37 @@ def main():
     
     # Filter state
     pitch_filtered = None
+    
+    # Instantiating the low-latency latest line reader
+    line_reader = LatestLineReader(ser_esp)
+
+    # State Machine initialization
+    STATE_STANDBY = 0
+    STATE_BALANCING = 1
+    current_state = STATE_STANDBY
+    state_just_entered = True
 
     try:
         while running:
-            # Read telemetry from IMU
-            line = ser_esp.readline()
-            if not line:
-                # If readline timed out (exceeded 0.5s), shut down motors immediately
-                print("\n[CRITICAL] IMU Telemetry lost! Timing out...")
-                break
+            # Read latest telemetry from IMU (non-blocking, low-latency)
+            line_str = line_reader.get_latest_line()
+            if line_str is None:
+                current_time = time.time()
+                if current_time - last_imu_time > 0.5:
+                    print("\n[CRITICAL] IMU Telemetry lost! Timing out...")
+                    break
+                time.sleep(0.001)  # small yield to prevent 100% CPU utilization
+                continue
 
             current_time = time.time()
-            dt = current_time - last_time
-            last_time = current_time
+            dt = current_time - last_imu_time
+            last_imu_time = current_time
 
             # Clamp dt to reasonable bounds in case of system lag
             dt = max(0.001, min(0.1, dt))
 
             # Decode line
             try:
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                if not line_str:
-                    continue
-                
                 # Parse CSV format: ax,ay,az,gx,gy,gz
                 values = line_str.split(',')
                 if len(values) != 6:
@@ -276,66 +304,91 @@ def main():
                 # Ignore malformed packets during serial start
                 continue
 
-            # --- Safety Check: Emergency Stop if tilted past safety angle ---
-            if abs(pitch) > args.safety_angle:
-                print(f"\n[⚠️] EMERGENCY STOP: Robot exceeded safety angle! Pitch: {pitch:.2f}°")
-                break
+            # --- State Machine ---
+            if current_state == STATE_STANDBY:
+                if state_just_entered:
+                    print("\n[*] Standby mode: Motors disarmed (brakes applied). Stand robot upright (+/- 5.0°) to re-arm.")
+                    try:
+                        ser_motor.write(frame_brake(0x01) + frame_brake(0x02))
+                    except Exception:
+                        pass
+                    state_just_entered = False
+                
+                right_speed = 0.0
+                left_speed = 0.0
+                
+                # Check if robot is close to target balance angle
+                if abs(pitch - args.target) < 5.0:
+                    print(f"\n[✓] Robot upright (Pitch: {pitch:.2f}°). Arming in 1 second... Keep steady!")
+                    try:
+                        ser_motor.write(frame_brake(0x01) + frame_brake(0x02))
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    
+                    # Reset control variables before starting
+                    pid.reset()
+                    last_commanded_speed = 0.0
+                    estimated_position = 0.0
+                    current_state = STATE_BALANCING
+                    state_just_entered = True
+                    # Discard any serial data accumulated during the sleep
+                    ser_esp.reset_input_buffer()
+                    last_imu_time = time.time()
+                
+            elif current_state == STATE_BALANCING:
+                # --- Safety Check: Emergency Stop if tilted past safety angle ---
+                if abs(pitch) > args.safety_angle:
+                    print(f"\n[⚠️] SAFETY SHUTOFF: Robot exceeded safety angle! Pitch: {pitch:.2f}°")
+                    current_state = STATE_STANDBY
+                    state_just_entered = True
+                    continue
 
-            # --- Velocity feedback to prevent runaway/drift ---
-            # We integrate the commanded speed to estimate wheel position.
-            estimated_position += last_commanded_speed * dt
-            # Clamp estimated position to avoid windup
-            estimated_position = max(-500.0, min(500.0, estimated_position))
-            
-            # The velocity feedback adjusts the target angle to lean the robot
-            # in the opposite direction of motion, bringing it to a stop.
-            velocity_target_offset = (args.kp_vel * last_commanded_speed) + (args.ki_vel * estimated_position)
-            # Clamp the target pitch adjustment to a safe range (e.g. +/- 3.0 degrees)
-            velocity_target_offset = max(-3.0, min(3.0, velocity_target_offset))
-            
-            # Adjust the PID target angle dynamically
-            pid.target = args.target - velocity_target_offset
+                # --- Velocity feedback to prevent runaway/drift ---
+                estimated_position += last_commanded_speed * dt
+                estimated_position = max(-500.0, min(500.0, estimated_position))
+                
+                velocity_target_offset = (args.kp_vel * last_commanded_speed) + (args.ki_vel * estimated_position)
+                velocity_target_offset = max(-3.0, min(3.0, velocity_target_offset))
+                
+                pid.target = args.target - velocity_target_offset
 
-            # --- PID Control Computation ---
-            control_output = pid.compute(pitch, gyro_y, dt, args.kp_nonlin)
+                # --- PID Control Computation ---
+                control_output = pid.compute(pitch, gyro_y, dt, args.kp_nonlin)
 
-            # Limit speeds to prevent runaway
-            target_rpm = max(-args.limit, min(args.limit, control_output))
-            
-            # --- Slew Rate Limiter to prevent sudden jumps ---
-            max_change = args.slew_limit * dt
-            if target_rpm > last_commanded_speed + max_change:
-                target_rpm = last_commanded_speed + max_change
-            elif target_rpm < last_commanded_speed - max_change:
-                target_rpm = last_commanded_speed - max_change
-            last_commanded_speed = target_rpm
+                # Limit speeds to prevent runaway
+                target_rpm = max(-args.limit, min(args.limit, control_output))
+                
+                # --- Slew Rate Limiter to prevent sudden jumps ---
+                max_change = args.slew_limit * dt
+                if target_rpm > last_commanded_speed + max_change:
+                    target_rpm = last_commanded_speed + max_change
+                elif target_rpm < last_commanded_speed - max_change:
+                    target_rpm = last_commanded_speed - max_change
+                last_commanded_speed = target_rpm
 
-            # Apply motor direction signs
-            # Right motor is ID 0x01
-            right_speed = args.right_sign * target_rpm
-            # Left motor is ID 0x02
-            left_speed = args.left_sign * target_rpm
+                # Apply motor direction signs
+                right_speed = args.right_sign * target_rpm
+                left_speed = args.left_sign * target_rpm
 
-            # Send velocity commands over RS485 bus
-            try:
-                ser_motor.write(frame_velocity(0x01, right_speed))
-                # Add a tiny delay to prevent collision/buffer overload on half-duplex RS485
-                time.sleep(0.001) 
-                ser_motor.write(frame_velocity(0x02, left_speed))
-            except serial.SerialException as e:
-                print(f"\n[CRITICAL] RS485 communication failure: {e}")
-                break
+                # Send velocity commands over RS485 bus (combined back-to-back writes)
+                try:
+                    ser_motor.write(frame_velocity(0x01, right_speed) + frame_velocity(0x02, left_speed))
+                except serial.SerialException as e:
+                    print(f"\n[CRITICAL] RS485 communication failure: {e}")
+                    break
 
             # Print dashboard every ~0.1 seconds to not flood console
             loop_count += 1
             if current_time - last_dashboard_time >= 0.1:
                 last_dashboard_time = current_time
+                state_str = "BAL" if current_state == STATE_BALANCING else "STB"
                 if args.show_raw:
                     acc_str = f"Acc: {ax:+5.3f}X {ay:+5.3f}Y {az:+5.3f}Z"
                     gyr_str = f"Gyr: {gx:+6.1f}X {gy:+6.1f}Y {gz:+6.1f}Z"
-                    print(f"\r[Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | {acc_str} | {gyr_str}", end="", flush=True)
+                    print(f"\r[{state_str} Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | {acc_str} | {gyr_str}", end="", flush=True)
                 else:
-                    print(f"\r[Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | GyroY: {gyro_y:+6.1f}°/s | Target RPM: {target_rpm:+6.1f} | R: {right_speed:+5.1f} | L: {left_speed:+5.1f}", end="", flush=True)
+                    print(f"\r[{state_str} Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | GyroY: {gyro_y:+6.1f}°/s | Target RPM: {last_commanded_speed:+6.1f} | R: {right_speed:+5.1f} | L: {left_speed:+5.1f}", end="", flush=True)
 
     except Exception as e:
         print(f"\n[ERROR] Unexpected error in control loop: {e}")
