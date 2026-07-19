@@ -121,12 +121,44 @@ def smooth_stop(ser_motor, current_speed_r, current_speed_l):
         except Exception:
             pass
 
+def resolve_port(port_name):
+    """
+    Resolves shorthand port names and prepends /dev/ on Linux if necessary.
+    E.g. tty0 -> /dev/ttyACM0 (or /dev/ttyUSB0)
+         tty1 -> /dev/ttyUSB0 (or /dev/ttyACM1)
+    """
+    if not port_name:
+        return port_name
+    if sys.platform.startswith('win'):
+        return port_name
+        
+    import os
+    if port_name == "tty0":
+        if os.path.exists("/dev/ttyACM0"):
+            return "/dev/ttyACM0"
+        elif os.path.exists("/dev/ttyUSB0"):
+            return "/dev/ttyUSB0"
+        return "/dev/ttyACM0"
+    elif port_name == "tty1":
+        if os.path.exists("/dev/ttyUSB0"):
+            return "/dev/ttyUSB0"
+        elif os.path.exists("/dev/ttyACM1"):
+            return "/dev/ttyACM1"
+        elif os.path.exists("/dev/ttyUSB1"):
+            return "/dev/ttyUSB1"
+        return "/dev/ttyUSB0"
+        
+    if not port_name.startswith('/dev/'):
+        if port_name.startswith('tty'):
+            return "/dev/" + port_name
+    return port_name
+
 # --- Main Program ---
 def main():
     parser = argparse.ArgumentParser(description="Self-Balancing Robot Controller")
     parser.add_argument("--imu", type=str, default=None, help="IMU (RP2040) serial port. Falls back to --esp.")
-    parser.add_argument("--esp", type=str, default="COM10", help="ESP32 serial port (deprecated, use --imu instead)")
-    parser.add_argument("--motor", type=str, default="COM13", help="Motor RS485 serial port (default: COM13)")
+    parser.add_argument("--esp", type=str, default=None, help="ESP32 serial port (deprecated, use --imu instead)")
+    parser.add_argument("--motor", type=str, default=None, help="Motor RS485 serial port")
     parser.add_argument("--baud-esp", type=int, default=115200, help="Baud rate for IMU (default: 115200)")
     parser.add_argument("--baud-motor", type=int, default=115200, help="Baud rate for RS485 (default: 115200)")
     parser.add_argument("--kp", type=float, default=1.2, help="PID Proportional gain (default: 1.2)")
@@ -148,13 +180,25 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.98, help="Complementary filter coefficient (default: 0.98)")
     args = parser.parse_args()
 
-    imu_port = args.imu if args.imu is not None else args.esp
+    # Determine dynamic defaults based on OS platform
+    is_windows = sys.platform.startswith('win')
+    
+    imu_raw = args.imu if args.imu is not None else args.esp
+    if imu_raw is None:
+        imu_raw = "COM10" if is_windows else "/dev/ttyACM0"
+        
+    motor_raw = args.motor
+    if motor_raw is None:
+        motor_raw = "COM13" if is_windows else "/dev/ttyUSB0"
+        
+    imu_port = resolve_port(imu_raw)
+    motor_port = resolve_port(motor_raw)
 
     print("=" * 60)
     print("           M0601 Self-Balancing Robot PID Controller")
     print("=" * 60)
     print(f"IMU Port:     {imu_port} (Baud: {args.baud_esp})")
-    print(f"Motor Port:   {args.motor} (Baud: {args.baud_motor})")
+    print(f"Motor Port:   {motor_port} (Baud: {args.baud_motor})")
     print(f"PID Params:   Kp={args.kp:.2f}, Ki={args.ki:.3f}, Kd={args.kd:.3f} | Kp-Nonlin={args.kp_nonlin:.3f}")
     print(f"Vel Loop:     Kp-Vel={args.kp_vel:.4f}, Ki-Vel={args.ki_vel:.5f}")
     print(f"Balance Target: {args.target:.2f} deg")
@@ -175,8 +219,8 @@ def main():
         sys.exit(1)
 
     try:
-        ser_motor = serial.Serial(args.motor, args.baud_motor, timeout=0.1)
-        print(f"[✓] Connected to RS485 Motor Bus on {args.motor}")
+        ser_motor = serial.Serial(motor_port, args.baud_motor, timeout=0.1)
+        print(f"[✓] Connected to RS485 Motor Bus on {motor_port}")
     except serial.SerialException as e:
         print(f"[✗] Failed to open RS485 serial port: {e}")
         ser_esp.close()
