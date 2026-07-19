@@ -20,6 +20,7 @@ import time
 import sys
 import argparse
 import signal
+import math
 
 # --- CRC8 Maxim Calculation ---
 def crc8_maxim(data):
@@ -123,9 +124,10 @@ def smooth_stop(ser_motor, current_speed_r, current_speed_l):
 # --- Main Program ---
 def main():
     parser = argparse.ArgumentParser(description="Self-Balancing Robot Controller")
-    parser.add_argument("--esp", type=str, default="COM10", help="ESP32 serial port (default: COM10)")
+    parser.add_argument("--imu", type=str, default=None, help="IMU (RP2040) serial port. Falls back to --esp.")
+    parser.add_argument("--esp", type=str, default="COM10", help="ESP32 serial port (deprecated, use --imu instead)")
     parser.add_argument("--motor", type=str, default="COM13", help="Motor RS485 serial port (default: COM13)")
-    parser.add_argument("--baud-esp", type=int, default=115200, help="Baud rate for ESP32 (default: 115200)")
+    parser.add_argument("--baud-esp", type=int, default=115200, help="Baud rate for IMU (default: 115200)")
     parser.add_argument("--baud-motor", type=int, default=115200, help="Baud rate for RS485 (default: 115200)")
     parser.add_argument("--kp", type=float, default=1.2, help="PID Proportional gain (default: 1.2)")
     parser.add_argument("--ki", type=float, default=0.0, help="PID Integral gain (default: 0.0)")
@@ -140,12 +142,18 @@ def main():
     parser.add_argument("--ki-vel", type=float, default=0.0005, help="Velocity feedback integral gain (default: 0.0005)")
     parser.add_argument("--show-raw", action="store_true", help="Print raw accelerometer and gyroscope values from MPU-6050")
     parser.add_argument("--slew-limit", type=float, default=150.0, help="Max wheel speed change rate in RPM/sec (default: 150.0)")
+    parser.add_argument("--imu-orientation", type=str, default="flat", choices=["flat", "vertical"], help="MPU6050 IMU mounting orientation (default: flat)")
+    parser.add_argument("--imu-pitch-sign", type=float, default=1.0, help="Direction multiplier for accelerometer pitch (1.0 or -1.0, default: 1.0)")
+    parser.add_argument("--imu-gyro-sign", type=float, default=1.0, help="Direction multiplier for gyroscope pitch rate (1.0 or -1.0, default: 1.0)")
+    parser.add_argument("--alpha", type=float, default=0.98, help="Complementary filter coefficient (default: 0.98)")
     args = parser.parse_args()
+
+    imu_port = args.imu if args.imu is not None else args.esp
 
     print("=" * 60)
     print("           M0601 Self-Balancing Robot PID Controller")
     print("=" * 60)
-    print(f"ESP32 Port:   {args.esp} (Baud: {args.baud_esp})")
+    print(f"IMU Port:     {imu_port} (Baud: {args.baud_esp})")
     print(f"Motor Port:   {args.motor} (Baud: {args.baud_motor})")
     print(f"PID Params:   Kp={args.kp:.2f}, Ki={args.ki:.3f}, Kd={args.kd:.3f} | Kp-Nonlin={args.kp_nonlin:.3f}")
     print(f"Vel Loop:     Kp-Vel={args.kp_vel:.4f}, Ki-Vel={args.ki_vel:.5f}")
@@ -154,14 +162,16 @@ def main():
     print(f"Slew Limit:   {args.slew_limit:.1f} RPM/sec")
     print(f"Right Wheel:  ID 0x01, Direction Sign: {args.right_sign}")
     print(f"Left Wheel:   ID 0x02, Direction Sign: {args.left_sign}")
+    print(f"IMU Align:    {args.imu_orientation} (Pitch Sign: {args.imu_pitch_sign}, Gyro Sign: {args.imu_gyro_sign})")
+    print(f"Filter Alpha: {args.alpha:.3f}")
     print("=" * 60)
 
     # Initialize serial ports
     try:
-        ser_esp = serial.Serial(args.esp, args.baud_esp, timeout=0.5)
-        print(f"[✓] Connected to ESP32 on {args.esp}")
+        ser_esp = serial.Serial(imu_port, args.baud_esp, timeout=0.5)
+        print(f"[✓] Connected to IMU on {imu_port}")
     except serial.SerialException as e:
-        print(f"[✗] Failed to open ESP32 serial port: {e}")
+        print(f"[✗] Failed to open IMU serial port: {e}")
         sys.exit(1)
 
     try:
@@ -194,7 +204,7 @@ def main():
         ser_motor.write(frame_velocity_mode(0x02))
         time.sleep(0.01)
 
-    # Clear ESP32 input buffer to avoid lag/stale readings
+    # Clear IMU input buffer to avoid lag/stale readings
     ser_esp.reset_input_buffer()
     
     last_time = time.time()
@@ -204,14 +214,17 @@ def main():
     right_speed = 0.0
     left_speed = 0.0
     estimated_position = 0.0
+    
+    # Filter state
+    pitch_filtered = None
 
     try:
         while running:
-            # Read telemetry from ESP32
+            # Read telemetry from IMU
             line = ser_esp.readline()
             if not line:
                 # If readline timed out (exceeded 0.5s), shut down motors immediately
-                print("\n[CRITICAL] ESP32 Telemetry lost! Timing out...")
+                print("\n[CRITICAL] IMU Telemetry lost! Timing out...")
                 break
 
             current_time = time.time()
@@ -224,20 +237,35 @@ def main():
             # Decode line
             try:
                 line_str = line.decode('utf-8', errors='ignore').strip()
-                
-                # Parse format: PITCH:<val>,ROLL:<val>,GYRO_Y:<val>,GYRO_X:<val>
-                parts = {}
-                for item in line_str.split(','):
-                    if ':' in item:
-                        k, v = item.split(':')
-                        parts[k] = float(v)
-                
-                pitch = parts.get("PITCH")
-                roll = parts.get("ROLL")
-                gyro_y = parts.get("GYRO_Y") # Pitch rate (deg/s)
-                
-                if pitch is None or gyro_y is None:
+                if not line_str:
                     continue
+                
+                # Parse CSV format: ax,ay,az,gx,gy,gz
+                values = line_str.split(',')
+                if len(values) != 6:
+                    continue
+                
+                ax, ay, az, gx, gy, gz = map(float, values)
+                
+                # Calculate accelerometer-based pitch based on chosen orientation
+                if args.imu_orientation == "flat":
+                    pitch_acc = math.degrees(math.atan2(ax, math.sqrt(ay**2 + az**2)))
+                elif args.imu_orientation == "vertical":
+                    pitch_acc = math.degrees(math.atan2(-az, math.sqrt(ay**2 + ax**2)))
+                else:
+                    pitch_acc = math.degrees(math.atan2(ax, az))
+                
+                # Apply sign corrections
+                pitch_acc *= args.imu_pitch_sign
+                gyro_y = gy * args.imu_gyro_sign  # rotation rate around Y-axis (pitch rate)
+                
+                # Complementary filter logic
+                if pitch_filtered is None:
+                    pitch_filtered = pitch_acc
+                else:
+                    pitch_filtered = args.alpha * (pitch_filtered + gyro_y * dt) + (1.0 - args.alpha) * pitch_acc
+                
+                pitch = pitch_filtered
                     
             except (ValueError, IndexError):
                 # Ignore malformed packets during serial start
@@ -298,8 +326,8 @@ def main():
             if current_time - last_dashboard_time >= 0.1:
                 last_dashboard_time = current_time
                 if args.show_raw:
-                    acc_str = f"Acc: {parts.get('ACC_X',0.0):+5.3f}X {parts.get('ACC_Y',0.0):+5.3f}Y {parts.get('ACC_Z',0.0):+5.3f}Z"
-                    gyr_str = f"Gyr: {parts.get('GYRO_X',0.0):+6.1f}X {gyro_y:+6.1f}Y {parts.get('GYR_Z',0.0):+6.1f}Z"
+                    acc_str = f"Acc: {ax:+5.3f}X {ay:+5.3f}Y {az:+5.3f}Z"
+                    gyr_str = f"Gyr: {gx:+6.1f}X {gy:+6.1f}Y {gz:+6.1f}Z"
                     print(f"\r[Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | {acc_str} | {gyr_str}", end="", flush=True)
                 else:
                     print(f"\r[Loop: {loop_count:6d}] Pitch: {pitch:+6.2f}° | GyroY: {gyro_y:+6.1f}°/s | Target RPM: {target_rpm:+6.1f} | R: {right_speed:+5.1f} | L: {left_speed:+5.1f}", end="", flush=True)
@@ -314,7 +342,7 @@ def main():
         # Close serial ports safely
         try:
             ser_esp.close()
-            print("[✓] ESP32 Serial Port closed.")
+            print("[✓] IMU Serial Port closed.")
         except Exception:
             pass
 
