@@ -307,11 +307,12 @@ def main():
             # --- State Machine ---
             if current_state == STATE_STANDBY:
                 if state_just_entered:
-                    print("\n[*] Standby mode: Motors disarmed (brakes applied). Stand robot upright (+/- 5.0°) to re-arm.")
+                    print("\n[*] Standby mode: Motors disarmed. Executing smooth stop...")
                     try:
-                        ser_motor.write(frame_brake(0x01) + frame_brake(0x02))
+                        smooth_stop(ser_motor, right_speed, left_speed)
                     except Exception:
                         pass
+                    print("[*] Stand robot upright (+/- 5.0°) to re-arm.")
                     state_just_entered = False
                 
                 right_speed = 0.0
@@ -321,7 +322,7 @@ def main():
                 if abs(pitch - args.target) < 5.0:
                     print(f"\n[✓] Robot upright (Pitch: {pitch:.2f}°). Arming in 1 second... Keep steady!")
                     try:
-                        ser_motor.write(frame_brake(0x01) + frame_brake(0x02))
+                        ser_motor.write(frame_velocity(0x01, 0) + frame_velocity(0x02, 0))
                     except Exception:
                         pass
                     time.sleep(1.0)
